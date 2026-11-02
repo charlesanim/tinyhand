@@ -47,7 +47,7 @@ final class WelcomeWindow: NSObject {
 
     private func refresh() {
         title.stringValue = granted ? "You're all set" : "Allow Accessibility"
-        subtitle.stringValue = granted ? "Press \(Preferences.toggleShortcut.display) any time to start." : "So your clicks become taps, not real clicks."
+        subtitle.stringValue = granted ? "Press \(Preferences.toggleShortcut.display) any time to start." : "To animate clicks and draw on your screen."
         button.title = granted ? "Start" : "Open Settings"
         tip.isHidden = granted || askedAt.map { Date().timeIntervalSince($0) < 10 } ?? true
     }

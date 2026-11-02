@@ -13,6 +13,7 @@ let package = Package(
             dependencies: [.product(name: "Sparkle", package: "Sparkle")],
             path: "Sources/TinyHand",
             linkerSettings: [.unsafeFlags(["-Xlinker", "-rpath", "-Xlinker", "@executable_path/../Frameworks"])]
-        )
+        ),
+        .testTarget(name: "TinyHandTests", dependencies: ["TinyHand"])
     ]
 )

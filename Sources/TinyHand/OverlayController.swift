@@ -1,5 +1,6 @@
 import AppKit
 import Carbon.HIToolbox
+import UniformTypeIdentifiers
 
 final class OverlayController {
     private final class OverlayWindow: NSWindow {
@@ -19,6 +20,14 @@ final class OverlayController {
     private var downPoint: CGPoint?
     private var buttonSeenDown = false
     private var dragEvents = 0
+    private(set) var mode = PointerMode.pointer
+    private let selectionLayer = CAShapeLayer()
+    private var selectionPoints: [CGPoint] = []
+    private var selectionPath: CGPath?
+    private var exporting = false
+    private var savePanel: NSSavePanel?
+    private let makeSavePanel: () -> NSSavePanel
+    private var captureTask: Task<Void, Never>?
 
     private let toolbar = Toolbar()
     private var revealUntil = Date.distantPast
@@ -46,7 +55,8 @@ final class OverlayController {
     var onActiveChanged: (() -> Void)?
     var onNeedsPermission: (() -> Void)?
 
-    init() {
+    init(makeSavePanel: @escaping () -> NSSavePanel = { NSSavePanel() }) {
+        self.makeSavePanel = makeSavePanel
         let frame = (NSScreen.main ?? NSScreen.screens.first).map { $0.frame }
             ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
 
@@ -61,39 +71,55 @@ final class OverlayController {
 
         armView = ArmView(frame: NSRect(origin: .zero, size: frame.size))
         window.contentView = armView
+        selectionLayer.strokeColor = NSColor.systemBlue.cgColor
+        selectionLayer.fillColor = NSColor.systemBlue.withAlphaComponent(0.12).cgColor
+        selectionLayer.lineWidth = 2
+        selectionLayer.lineDashPattern = [6, 4]
+        selectionLayer.fillRule = .evenOdd
+        armView.layer?.addSublayer(selectionLayer)
 
-        inputTap.onMouseDown = { [weak self] in
-            guard let self = self else {
+        inputTap.onMouseDown = { [weak self] location in
+            guard let self = self, self.isActive, !self.exporting else {
                 return
             }
             self.armView.press()
             self.armView.held = true
             self.tapSound.play()
             self.toolbar.hideHint()
-            self.downPoint = self.localMouse()
+            self.downPoint = self.localPoint(location)
+            if self.mode == .screenshot {
+                self.clearSelection()
+                self.selectionPoints = self.downPoint.map { [$0] } ?? []
+            }
             self.dragEvents = 0
             Log.write("press at \(self.downPoint.map { "\(Int($0.x)),\(Int($0.y))" } ?? "?")")
             self.noteButtonEvent()
         }
-        inputTap.onLeftDragged = { [weak self] in
-            self?.dragEvents += 1
-            self?.drag()
-            self?.wake()
+        inputTap.onLeftDragged = { [weak self] location in
+            guard let self = self, self.isActive, !self.exporting else { return }
+            self.dragEvents += 1
+            self.drag(to: self.localPoint(location))
+            self.wake()
         }
-        inputTap.onMouseUp = { [weak self] in
-            self?.release()
-            self?.noteButtonEvent()
+        inputTap.onMouseUp = { [weak self] location in
+            guard let self = self, self.isActive, !self.exporting else { return }
+            self.drag(to: self.localPoint(location))
+            self.release()
+            self.noteButtonEvent()
         }
         inputTap.onInteractDown = { [weak self] in
-            self?.armView.press()
-            self?.armView.held = true
-            self?.noteButtonEvent()
+            guard let self = self, self.isActive, !self.exporting else { return }
+            self.armView.press()
+            self.armView.held = true
+            self.tapSound.play()
+            self.noteButtonEvent()
         }
         inputTap.onInteractUp = { [weak self] in
-            self?.armView.held = false
-            self?.guardCursorUntil = Date().addingTimeInterval(2)
+            guard let self = self, self.isActive, !self.exporting else { return }
+            self.armView.held = false
+            self.guardCursorUntil = Date().addingTimeInterval(2)
             CursorHider.reassert(urgent: true)
-            self?.noteButtonEvent()
+            self.noteButtonEvent()
         }
         inputTap.onPassThroughPress = { [weak self] location in
             guard let screen = self?.currentScreen() else {
@@ -119,6 +145,13 @@ final class OverlayController {
             self?.exit()
             self?.onNeedsPermission?()
         }
+        toolbar.onModeChanged = { [weak self] in self?.setMode($0) }
+        toolbar.onSave = { [weak self] in
+            guard let self = self else { return }
+            if self.mode == .screenshot { self.saveScreenshot() }
+            else { self.saveDrawing() }
+        }
+        toolbar.onClear = { [weak self] in self?.clearInk() }
         toolbar.select(armView.style)
         tapSound.enabled = soundOn
         toolbar.setSoundOn(soundOn)
@@ -165,7 +198,8 @@ final class OverlayController {
             return
         }
         ownMenuOpen = suspended
-        inputTap.setActive(!suspended)
+        guard !exporting else { return }
+        inputTap.setActive(!suspended && !exporting)
         if let screen = currentScreen() {
             updateZones(mouse: NSEvent.mouseLocation, screen: screen)
         }
@@ -185,6 +219,17 @@ final class OverlayController {
         armView.held = false
         downPoint = nil
         armView.ink.end()
+        if mode == .screenshot, !selectionPoints.isEmpty {
+            do {
+                selectionPath = try Capture.selection(selectionPoints)
+                revealUntil = Date().addingTimeInterval(10)
+            } catch {
+                clearSelection()
+                Log.write("selection rejected: \(error.localizedDescription)")
+                toolbar.showHint([("Draw a shape", "at least 4 points wide and tall")])
+            }
+        }
+        refreshSave()
     }
 
     var style: PointerStyle { armView.style }
@@ -199,20 +244,75 @@ final class OverlayController {
         toolbar.center(of: style)
     }
 
+    func toolbarButtonCenter(_ mode: PointerMode) -> CGPoint? {
+        toolbar.center(of: mode)
+    }
+
     var inkStrokes: Int { armView.ink.layer.sublayers?.count ?? 0 }
+    var savedInkStrokes: Int { armView.ink.savedStrokes.count }
 
     var debugState: String {
         "held=\(armView.held) downPoint=\(downPoint != nil) drawing=\(armView.ink.isDrawing) strokes=\(inkStrokes)"
     }
 
     func clearInk() {
+        downPoint = nil
+        armView.held = false
         armView.ink.clear()
+        clearSelection()
+        refreshSave()
     }
 
-    private func drag() {
-        guard let start = downPoint, let p = localMouse() else {
+    var canSaveDrawing: Bool { !armView.ink.savedStrokes.isEmpty }
+    var canSaveScreenshot: Bool { selectionPath != nil }
+    var onCaptureChanged: (() -> Void)?
+
+    func setMode(_ mode: PointerMode) {
+        guard !exporting else { return }
+        release()
+        clearSelection()
+        self.mode = mode
+        inputTap.mode = mode
+        // The overlay must never win hit-testing over the Dock in Pointer mode.
+        window.ignoresMouseEvents = true
+        refreshSave()
+        revealUntil = Date().addingTimeInterval(5)
+        if isActive {
+            let text = mode == .pointer ? "click and drag normally"
+                : mode == .draw ? "drag to draw, then save a PNG"
+                : "draw a shape, then click Save"
+            toolbar.showHint([(mode.title, text)])
+        }
+    }
+
+    private func refreshSave() {
+        toolbar.setMode(mode, canSave: mode == .screenshot ? canSaveScreenshot : canSaveDrawing)
+        onCaptureChanged?()
+    }
+
+    private func clearSelection() {
+        selectionPoints = []
+        selectionPath = nil
+        selectionLayer.path = nil
+    }
+
+    private func drag(to point: CGPoint? = nil) {
+        guard !exporting, let start = downPoint, let p = point ?? localMouse() else {
             return
         }
+        if mode == .screenshot {
+            if let last = selectionPoints.last, hypot(p.x - last.x, p.y - last.y) < 1.5 { return }
+            selectionPoints.append(p)
+            let path = CGMutablePath()
+            path.addLines(between: selectionPoints)
+            path.closeSubpath()
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            selectionLayer.path = path
+            CATransaction.commit()
+            return
+        }
+        guard mode == .draw else { return }
         let ink = armView.ink
         if !ink.isDrawing {
             if hypot(p.x - start.x, p.y - start.y) < 4 {
@@ -221,6 +321,12 @@ final class OverlayController {
             ink.begin(at: start, width: armView.inkWidth)
         }
         ink.extend(to: p)
+    }
+
+    private func localPoint(_ cgPoint: CGPoint) -> CGPoint? {
+        guard let frame = currentFrame else { return nil }
+        let point = OverlayController.cgPoint(cgPoint)
+        return CGPoint(x: point.x - frame.minX, y: point.y - frame.minY)
     }
 
     private func localMouse() -> CGPoint? {
@@ -277,10 +383,7 @@ final class OverlayController {
         revealUntil = Date().addingTimeInterval(3)
         if installed && !UserDefaults.standard.bool(forKey: OverlayController.hintShownKey) {
             UserDefaults.standard.set(true, forKey: OverlayController.hintShownKey)
-            var parts: [(key: String, text: String)] = [("Click", "to tap"), ("Drag", "to draw")]
-            if Preferences.interactKey != .off {
-                parts.append(("Hold \(Preferences.interactKey.symbol)", "to click for real"))
-            }
+            var parts: [(key: String, text: String)] = [("Pointer", "to click"), ("Draw", "to sketch"), ("Screenshot", "to select")]
             parts.append(("Esc", "to exit"))
             toolbar.showHint(parts)
             revealUntil = Date().addingTimeInterval(10)
@@ -298,6 +401,9 @@ final class OverlayController {
             return
         }
         isActive = false
+        captureTask?.cancel()
+        captureTask = nil
+        savePanel?.cancel(nil)
 
         timer?.invalidate()
         timer = nil
@@ -311,6 +417,8 @@ final class OverlayController {
         armView.held = false
         downPoint = nil
         armView.ink.clear()
+        clearSelection()
+        refreshSave()
         window.ignoresMouseEvents = true
         window.orderOut(nil)
         toolbar.hide()
@@ -327,7 +435,7 @@ final class OverlayController {
         let f = toolbar.frame
         let near = f.insetBy(dx: -80, dy: 0).union(f.offsetBy(dx: 0, dy: 90)).insetBy(dx: 0, dy: -10).contains(mouse)
         let needsPermission = !inputTap.isInstalled
-        let drawing = armView.ink.isDrawing
+        let drawing = armView.ink.isDrawing || downPoint != nil
         toolbar.setRevealed(!drawing && (near || Date() < revealUntil || needsPermission))
 
         let menuLikely = !menuRects.isEmpty || ownMenuOpen || Date() < menuOpeningUntil
@@ -343,7 +451,7 @@ final class OverlayController {
         let overMenu = menuBar.contains(mouse) || menuRects.contains { $0.contains(cgMouse) }
             || Date() < menuOpeningUntil
         let key = Preferences.interactKey.cgFlags
-        let interacting = (!key.isEmpty && CGEventSource.flagsState(.hidSystemState).contains(key)) || inputTap.interactPressing
+        let interacting = mode != .pointer && ((!key.isEmpty && CGEventSource.flagsState(.hidSystemState).contains(key)) || inputTap.interactPressing)
         interactHeld = interacting
         menuHover = overMenu
         let normal = !drawing && !Preferences.interactKeepsHand && (interacting || overMenu || ownMenuOpen)
@@ -372,7 +480,7 @@ final class OverlayController {
     }
 
     private func setEscEnabled(_ enabled: Bool) {
-        if enabled && isActive && escHotKey == nil {
+        if enabled && isActive && !exporting && escHotKey == nil {
             escHotKey = HotKeyCenter.shared.register(keyCode: UInt32(kVK_Escape), modifiers: 0) { [weak self] in
                 self?.exit()
             }
@@ -460,6 +568,10 @@ final class OverlayController {
     }
 
     private func currentScreen() -> NSScreen? {
+        if mode == .screenshot, !selectionPoints.isEmpty,
+           let screen = NSScreen.screens.first(where: { $0.frame == currentFrame }) {
+            return screen
+        }
         let mouse = NSEvent.mouseLocation
         return NSScreen.screens.first { NSMouseInRect(mouse, $0.frame, false) }
             ?? NSScreen.main
@@ -536,6 +648,7 @@ final class OverlayController {
     }
 
     private func tick() {
+        guard !exporting else { return }
         let mouse = NSEvent.mouseLocation
         guard let screen = currentScreen() else {
             return
@@ -543,12 +656,15 @@ final class OverlayController {
 
         if currentFrame != screen.frame {
             let moving = currentFrame != nil
-            currentFrame = screen.frame
             if moving {
                 release()
+                clearSelection()
                 revealUntil = Date().addingTimeInterval(1.5)
             }
-            armView.ink.clear()
+            currentFrame = screen.frame
+            armView.ink.clearVisible()
+            armView.ink.origin = screen.frame.origin
+            refreshSave()
             window.setFrame(screen.frame, display: false)
             armView.frame = NSRect(origin: .zero, size: screen.frame.size)
             toolbar.place(on: screen)
@@ -561,7 +677,7 @@ final class OverlayController {
 
         updateZones(mouse: mouse, screen: screen)
         let overDock = DockArea.contains(OverlayController.cgPoint(mouse))
-        let catchMouse = overDock && inputTap.isInstalled && !normalCursor && !interactHeld
+        let catchMouse = mode != .pointer && overDock && inputTap.isInstalled && !normalCursor && !interactHeld
         if window.ignoresMouseEvents == catchMouse {
             window.ignoresMouseEvents = !catchMouse
         }
@@ -587,5 +703,114 @@ final class OverlayController {
             return
         }
         drag()
+    }
+
+    func saveDrawing() {
+        guard !exporting else { return }
+        armView.ink.end()
+        do {
+            let image = try Capture.drawing(armView.ink.savedStrokes, scale: armView.ink.scale)
+            beginExport()
+            presentSave(image, name: "TinyHand Drawing")
+        } catch {
+            beginExport()
+            showCaptureError(error)
+            finishExport()
+        }
+    }
+
+    func saveScreenshot() {
+        guard !exporting else { return }
+        guard let path = selectionPath, let frame = currentFrame,
+              let screen = NSScreen.screens.first(where: { $0.frame == frame }),
+              let id = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID else {
+            beginExport()
+            showCaptureError(selectionPath == nil ? CaptureError.emptySelection : CaptureError.displayUnavailable)
+            finishExport()
+            return
+        }
+        beginExport()
+        guard CGPreflightScreenCaptureAccess() || CGRequestScreenCaptureAccess() else {
+            showCaptureError(CaptureError.permission)
+            finishExport()
+            return
+        }
+        captureTask = Task { @MainActor [weak self] in
+            guard let self = self else { return }
+            do {
+                // Allow our windows to leave the compositor before the macOS 13 fallback.
+                try await Task.sleep(nanoseconds: 150_000_000)
+                let desktop = try await Capture.screen(id: id, frame: OverlayController.cgRect(frame))
+                try Task.checkCancellation()
+                let image = try Capture.screenshot(desktop, path: path, screenSize: frame.size)
+                self.presentSave(image, name: "TinyHand Screenshot")
+            } catch is CancellationError {
+                self.finishExport()
+            } catch {
+                if !Task.isCancelled && self.isActive { self.showCaptureError(error) }
+                self.finishExport()
+            }
+            self.captureTask = nil
+        }
+    }
+
+    private func beginExport() {
+        exporting = true
+        inputTap.setActive(false)
+        setEscEnabled(false)
+        window.orderOut(nil)
+        toolbar.hide()
+        CursorHider.show()
+    }
+
+    private func finishExport() {
+        exporting = false
+        guard isActive else { return }
+        inputTap.setActive(!ownMenuOpen)
+        normalCursor = false
+        armView.pointerHidden = false
+        CursorHider.hide()
+        window.orderFrontRegardless()
+        toolbar.show()
+        revealUntil = Date().addingTimeInterval(5)
+        tick()
+        refreshSave()
+    }
+
+    private func presentSave(_ image: CGImage, name: String) {
+        let panel = makeSavePanel()
+        panel.title = name
+        panel.nameFieldStringValue = "\(name).png"
+        panel.allowedContentTypes = [.png]
+        panel.canCreateDirectories = true
+        savePanel = panel
+        NSApp.activate(ignoringOtherApps: true)
+        panel.begin { [weak self] response in
+            guard let self = self else { return }
+            defer {
+                self.savePanel = nil
+                self.finishExport()
+            }
+            guard response == .OK, let url = panel.url else { return }
+            do { try Capture.png(image).write(to: url, options: .atomic) }
+            catch { self.showCaptureError(error) }
+        }
+    }
+
+    private func showCaptureError(_ error: Error) {
+        Log.write("capture failed: \(error.localizedDescription)")
+        let alert = NSAlert()
+        alert.messageText = "Couldn't save capture"
+        alert.informativeText = error.localizedDescription
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "OK")
+        if case CaptureError.permission = error {
+            alert.addButton(withTitle: "Open Settings")
+        }
+        NSApp.activate(ignoringOtherApps: true)
+        if alert.runModal() == .alertSecondButtonReturn,
+           let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture") {
+            NSWorkspace.shared.open(url)
+        }
     }
 }
