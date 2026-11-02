@@ -11,5 +11,7 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+      - name: Test input routing and image export
+        run: swift test
       - name: Build (universal)
         run: swift build -c release --arch arm64 --arch x86_64

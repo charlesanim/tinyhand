@@ -5,6 +5,9 @@ final class Toolbar {
     var onToggleSound: (() -> Void)?
     var onExit: (() -> Void)?
     var onFixPermission: (() -> Void)?
+    var onModeChanged: ((PointerMode) -> Void)?
+    var onSave: (() -> Void)?
+    var onClear: (() -> Void)?
 
     private final class Panel: NSPanel {
         override var canBecomeKey: Bool { false }
@@ -25,6 +28,9 @@ final class Toolbar {
     private var inkOpen = false
     private let permissionButton = Button()
     private var soundButton: Button?
+    private var saveButton: Button?
+    private let modes = NSSegmentedControl(labels: PointerMode.allCases.map(\.title),
+                                           trackingMode: .selectOne, target: nil, action: nil)
     private(set) var revealed = false
 
     private let tray: Panel
@@ -87,11 +93,34 @@ final class Toolbar {
         ])
 
         stack.addArrangedSubview(Toolbar.divider())
+        modes.selectedSegment = 0
+        for (index, width) in [CGFloat(72), 58, 104].enumerated() {
+            modes.setWidth(width, forSegment: index)
+        }
+        modes.segmentStyle = .rounded
+        modes.appearance = NSAppearance(named: .darkAqua)
+        modes.target = self
+        modes.action = #selector(modeChanged)
+        modes.setAccessibilityLabel("Pointer mode")
+        modes.setToolTip("Click and drag in macOS normally", forSegment: 0)
+        modes.setToolTip("Draw without clicking the app underneath", forSegment: 1)
+        modes.setToolTip("Draw a shape, then save the area inside it", forSegment: 2)
+        stack.addArrangedSubview(modes)
+        stack.addArrangedSubview(Toolbar.divider())
         let ink = makeButton(image: nil, tip: "Ink colour") { [weak self] in
             self?.toggleInk()
         }
         inkButton = ink
         stack.addArrangedSubview(ink)
+        let save = makeButton(symbol: "square.and.arrow.down", tip: "Save Drawing as PNG") { [weak self] in
+            self?.onSave?()
+        }
+        save.isEnabled = false
+        saveButton = save
+        stack.addArrangedSubview(save)
+        stack.addArrangedSubview(makeButton(symbol: "trash", tip: "Clear Drawing and Selection") { [weak self] in
+            self?.onClear?()
+        })
         let sound = makeButton(symbol: "speaker.wave.2.fill", tip: "Tap sound") { [weak self] in
             self?.onToggleSound?()
         }
@@ -128,6 +157,19 @@ final class Toolbar {
             self?.rebuildStyles()
             self?.refreshInk()
         }
+    }
+
+    @objc private func modeChanged() {
+        guard PointerMode.allCases.indices.contains(modes.selectedSegment) else { return }
+        onModeChanged?(PointerMode.allCases[modes.selectedSegment])
+    }
+
+    func setMode(_ mode: PointerMode, canSave: Bool) {
+        modes.selectedSegment = PointerMode.allCases.firstIndex(of: mode) ?? 0
+        let tip = mode == .screenshot ? "Save Selected Area as PNG" : "Save Drawing as PNG"
+        saveButton?.toolTip = tip
+        saveButton?.setAccessibilityLabel(tip)
+        saveButton?.isEnabled = canSave
     }
 
     private func toggleInk() {
@@ -247,6 +289,14 @@ final class Toolbar {
         }
         let r = w.convertToScreen(b.convert(b.bounds, to: nil))
         return CGPoint(x: r.midX, y: r.midY)
+    }
+
+    func center(of mode: PointerMode) -> CGPoint? {
+        guard let index = PointerMode.allCases.firstIndex(of: mode) else { return nil }
+        let r = panel.convertToScreen(modes.convert(modes.bounds, to: nil))
+        let widths = PointerMode.allCases.indices.map { modes.width(forSegment: $0) }
+        let padding = (r.width - widths.reduce(0, +)) / 2
+        return CGPoint(x: r.minX + padding + widths.prefix(index).reduce(0, +) + widths[index] / 2, y: r.midY)
     }
 
     func snapshot() -> NSBitmapImageRep? {
@@ -386,6 +436,8 @@ final class Toolbar {
 
     func hide() {
         setInkOpen(false)
+        tray.orderOut(nil)
+        hint?.orderOut(nil)
         hideHint()
         revealed = false
         panel.alphaValue = 0

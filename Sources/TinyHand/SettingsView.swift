@@ -403,7 +403,7 @@ private struct GeneralPage: View {
         VStack(alignment: .leading, spacing: 22) {
             if !AXIsProcessTrusted() {
                 Card(title: "Permission") {
-                    Row("Accessibility", detail: "Needed so clicks become taps and you can draw.") {
+                    Row("Accessibility", detail: "Needed to animate clicks and draw on your screen.") {
                         PillButton(title: "Open Settings") {
                             if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
                                 NSWorkspace.shared.open(url)
@@ -423,8 +423,8 @@ private struct GeneralPage: View {
             if let error = model.shortcutError {
                 Text(error).font(.system(size: 12)).foregroundColor(.red)
             }
-            Card(title: "Clicking for real") {
-                Row("Hold to use the app", detail: "Clicks, drags and scrolls reach the app.") {
+            Card(title: "While drawing or selecting") {
+                Row("Hold to use the app", detail: "Pointer mode always lets clicks and drags through.") {
                     Picker("", selection: model.binding({ Preferences.interactKey }, { Preferences.interactKey = $0 })) {
                         ForEach(InteractKey.allCases, id: \.self) { key in
                             Text(key.title).tag(key)
@@ -972,7 +972,7 @@ private struct DrawingPage: View {
                     }
                 }
             }
-            Row("Lines fade", detail: "Clear them any time with \(Preferences.clearShortcut.display).") {
+            Row("Lines fade", detail: "Faded lines can still be saved. \(Preferences.clearShortcut.display) discards them.") {
                 Picker("", selection: model.binding({ Preferences.fadeSeconds }, { Preferences.fadeSeconds = $0 })) {
                     ForEach(DrawingPage.choices, id: \.1) { choice in
                         Text(choice.0).tag(choice.1)

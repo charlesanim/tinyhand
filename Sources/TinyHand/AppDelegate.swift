@@ -13,6 +13,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var toggleItem: NSMenuItem?
     private var clearItem: NSMenuItem?
     private var soundItem: NSMenuItem?
+    private var saveDrawingItem: NSMenuItem?
+    private var saveScreenshotItem: NSMenuItem?
+    private var modeItems: [NSMenuItem] = []
     private var toggleHotKey: UInt32?
     private var clearHotKey: UInt32?
 
@@ -27,6 +30,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         overlay.onSoundChanged = { [weak self] in
             self?.refreshMenu()
         }
+        overlay.onCaptureChanged = { [weak self] in self?.refreshMenu() }
         overlay.extraPassThrough = { [weak self] in
             guard let frame = self?.statusItem.button?.window?.frame else {
                 return []
@@ -71,6 +75,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         clearItem = clear
         soundItem = sound
         menu.addItem(toggle)
+        menu.autoenablesItems = false
+        for (index, mode) in PointerMode.allCases.enumerated() {
+            let item = NSMenuItem(title: "\(mode.title) Mode", action: #selector(selectMode(_:)), keyEquivalent: "")
+            item.tag = index
+            item.image = NSImage(systemSymbolName: mode.symbol, accessibilityDescription: mode.title)
+            modeItems.append(item)
+            menu.addItem(item)
+        }
+        let saveDrawing = NSMenuItem(title: "Save Drawing as PNG…", action: #selector(saveDrawing), keyEquivalent: "")
+        let saveScreenshot = NSMenuItem(title: "Save Selected Area as PNG…", action: #selector(saveScreenshot), keyEquivalent: "")
+        saveDrawingItem = saveDrawing
+        saveScreenshotItem = saveScreenshot
+        menu.addItem(saveDrawing)
+        menu.addItem(saveScreenshot)
         menu.addItem(clear)
         menu.addItem(sound)
         menu.addItem(.separator())
@@ -127,6 +145,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         toggleItem?.title = "\(on ? "Turn Pointer Off" : "Turn Pointer On")    \(Preferences.toggleShortcut.display)"
         clearItem?.title = "Clear Drawing    \(Preferences.clearShortcut.display)"
         soundItem?.state = overlay.soundOn ? .on : .off
+        saveDrawingItem?.isEnabled = overlay.canSaveDrawing
+        saveScreenshotItem?.isEnabled = overlay.canSaveScreenshot
+        for item in modeItems {
+            item.state = PointerMode.allCases[item.tag] == overlay.mode ? .on : .off
+        }
         permissionItem?.isHidden = AXIsProcessTrusted()
     }
 
@@ -185,6 +208,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func clearInk() {
         overlay.clearInk()
+    }
+
+    @objc private func selectMode(_ sender: NSMenuItem) {
+        overlay.setMode(PointerMode.allCases[sender.tag])
+        if !overlay.isActive { overlay.activate() }
+    }
+
+    @objc private func saveDrawing() {
+        overlay.saveDrawing()
+    }
+
+    @objc private func saveScreenshot() {
+        overlay.saveScreenshot()
     }
 
     @objc private func toggleSound() {

@@ -1,18 +1,47 @@
 import AppKit
 
+enum PointerMode: String, CaseIterable {
+    case pointer, draw, screenshot
+
+    var title: String {
+        switch self {
+        case .pointer: return "Pointer"
+        case .draw: return "Draw"
+        case .screenshot: return "Screenshot"
+        }
+    }
+
+    var symbol: String {
+        switch self {
+        case .pointer: return "cursorarrow"
+        case .draw: return "pencil.tip"
+        case .screenshot: return "viewfinder"
+        }
+    }
+}
+
 final class InputTap {
-    var onMouseDown: (() -> Void)?
+    var onMouseDown: ((CGPoint) -> Void)?
     var onInteractDown: (() -> Void)?
     var onInteractUp: (() -> Void)?
-    var onMouseUp: (() -> Void)?
-    var onLeftDragged: (() -> Void)?
+    var onMouseUp: ((CGPoint) -> Void)?
+    var onLeftDragged: ((CGPoint) -> Void)?
     var onPassThroughPress: ((CGPoint) -> Void)?
 
     private let lock = NSLock()
     private var _active = false
     private var _passThroughRects: [CGRect] = []
     private var _interactKey: CGEventFlags = []
-    private var _interactPress = false
+    private var _mode = PointerMode.pointer
+    private enum Route {
+        case native(CGEventFlags), controls, drawing
+    }
+    private var presses: [Int64: Route] = [:]
+
+    var mode: PointerMode {
+        get { lock.withLock { _mode } }
+        set { lock.withLock { _mode = newValue } }
+    }
 
     var passThroughRects: [CGRect] {
         get { lock.withLock { _passThroughRects } }
@@ -29,10 +58,14 @@ final class InputTap {
     }
 
     var interactPressing: Bool {
-        lock.withLock { _interactPress }
+        lock.withLock {
+            presses.values.contains {
+                if case .native(let flags) = $0 { return !flags.isEmpty }
+                return false
+            }
+        }
     }
 
-    private var passingThrough = false
     private(set) var maxWaitMs: Double = 0
     private var tap: CFMachPort?
     private var thread: Thread?
@@ -45,16 +78,12 @@ final class InputTap {
             return true
         }
 
-        let mask: CGEventMask =
-            (1 << CGEventType.leftMouseDown.rawValue) |
-            (1 << CGEventType.leftMouseUp.rawValue) |
-            (1 << CGEventType.rightMouseDown.rawValue) |
-            (1 << CGEventType.rightMouseUp.rawValue) |
-            (1 << CGEventType.otherMouseDown.rawValue) |
-            (1 << CGEventType.otherMouseUp.rawValue) |
-            (1 << CGEventType.leftMouseDragged.rawValue) |
-            (1 << CGEventType.rightMouseDragged.rawValue) |
-            (1 << CGEventType.otherMouseDragged.rawValue)
+        let types: [CGEventType] = [
+            .leftMouseDown, .leftMouseUp, .rightMouseDown, .rightMouseUp,
+            .otherMouseDown, .otherMouseUp, .leftMouseDragged,
+            .rightMouseDragged, .otherMouseDragged,
+        ]
+        let mask = types.reduce(CGEventMask(0)) { $0 | (CGEventMask(1) << $1.rawValue) }
 
         let refcon = Unmanaged.passUnretained(self).toOpaque()
         guard let tap = CGEvent.tapCreate(
@@ -96,7 +125,7 @@ final class InputTap {
     func setActive(_ value: Bool) {
         lock.withLock {
             _active = value
-            _interactPress = false
+            presses.removeAll()
         }
         guard let tap = tap else {
             return
@@ -118,7 +147,7 @@ final class InputTap {
         maxWaitMs = 0
     }
 
-    private func handle(type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
+    func handle(type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
         if event.timestamp > 0 {
             let wait = Double(DispatchTime.now().uptimeNanoseconds &- event.timestamp) / 1_000_000
             if wait < 600_000 {
@@ -139,55 +168,61 @@ final class InputTap {
             return Unmanaged.passUnretained(event)
         }
 
-        let key = interactKey
-        switch type {
-        case .leftMouseDown, .rightMouseDown, .otherMouseDown:
-            if !key.isEmpty && (event.flags.contains(key) || CGEventSource.flagsState(.hidSystemState).contains(key)) {
-                lock.withLock { _interactPress = true }
-                DispatchQueue.main.async { [weak self] in self?.onInteractDown?() }
+        let isDown = [.leftMouseDown, .rightMouseDown, .otherMouseDown].contains(type)
+        let isUp = [.leftMouseUp, .rightMouseUp, .otherMouseUp].contains(type)
+        let button = event.getIntegerValueField(.mouseEventButtonNumber)
+        let location = event.location
+        // Latch the route and modifier on mouse-down, independently for each button.
+        let route: Route = lock.withLock {
+            if isDown {
+                if _passThroughRects.contains(where: { $0.contains(location) }) {
+                    presses[button] = .controls
+                } else if _mode == .pointer {
+                    presses[button] = .native([])
+                } else if !_interactKey.isEmpty && event.flags.contains(_interactKey) {
+                    presses[button] = .native(_interactKey)
+                } else {
+                    presses[button] = .drawing
+                }
             }
-        default:
-            break
+            let route = presses[button] ?? .native([])
+            if isUp { presses[button] = nil }
+            return route
         }
-        if lock.withLock({ _interactPress }) {
-            event.flags.remove(key)
-            if type == .leftMouseUp || type == .rightMouseUp || type == .otherMouseUp {
-                lock.withLock { _interactPress = false }
+
+        switch route {
+        case .native(let modifier):
+            event.flags.remove(modifier)
+            if isDown {
+                DispatchQueue.main.async { [weak self] in self?.onInteractDown?() }
+            } else if isUp {
                 DispatchQueue.main.async { [weak self] in self?.onInteractUp?() }
             }
             return Unmanaged.passUnretained(event)
-        }
-
-        switch type {
-        case .leftMouseDown, .rightMouseDown, .otherMouseDown:
-            passingThrough = passThroughRects.contains { $0.contains(event.location) }
-            if passingThrough {
-                let location = event.location
+        case .controls:
+            if isDown {
                 DispatchQueue.main.async { [weak self] in self?.onPassThroughPress?(location) }
             }
-        default:
-            break
-        }
-        if passingThrough {
-            if type == .leftMouseUp || type == .rightMouseUp || type == .otherMouseUp {
-                passingThrough = false
-            }
             return Unmanaged.passUnretained(event)
+        case .drawing:
+            break
         }
 
         switch type {
-        case .leftMouseDown, .rightMouseDown, .otherMouseDown:
-            DispatchQueue.main.async { [weak self] in self?.onMouseDown?() }
+        case .leftMouseDown:
+            DispatchQueue.main.async { [weak self] in self?.onMouseDown?(location) }
             return nil
-        case .leftMouseUp, .rightMouseUp, .otherMouseUp:
-            DispatchQueue.main.async { [weak self] in self?.onMouseUp?() }
+        case .leftMouseUp:
+            DispatchQueue.main.async { [weak self] in self?.onMouseUp?(location) }
             return nil
         case .leftMouseDragged, .rightMouseDragged, .otherMouseDragged:
             if type == .leftMouseDragged {
-                DispatchQueue.main.async { [weak self] in self?.onLeftDragged?() }
+                DispatchQueue.main.async { [weak self] in self?.onLeftDragged?(location) }
             }
             event.type = .mouseMoved
             return Unmanaged.passUnretained(event)
+        case .rightMouseDown, .rightMouseUp, .otherMouseDown, .otherMouseUp:
+            return nil
         default:
             return Unmanaged.passUnretained(event)
         }

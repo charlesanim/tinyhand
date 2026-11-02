@@ -12,7 +12,7 @@ if let idx = CommandLine.arguments.firstIndex(of: "--ax-status") {
     let mask: CGEventMask = 1 << CGEventType.leftMouseDown.rawValue
     let tap = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap, options: .defaultTap,
                                 eventsOfInterest: mask, callback: { _, _, e, _ in Unmanaged.passUnretained(e) }, userInfo: nil)
-    let text = "trusted=\(AXIsProcessTrusted()) tap=\(tap != nil) bundle=\(Bundle.main.bundlePath)\n"
+    let text = "trusted=\(AXIsProcessTrusted()) tap=\(tap != nil) screen=\(CGPreflightScreenCaptureAccess()) bundle=\(Bundle.main.bundlePath)\n"
     try? text.write(toFile: out, atomically: true, encoding: .utf8)
     exit(0)
 }
@@ -28,7 +28,7 @@ if let idx = CommandLine.arguments.firstIndex(of: "--toolbar-test") {
         print("rendered \(out)")
     }
     if CommandLine.arguments.contains("--hint") {
-        bar.showHint([("Click", "to tap"), ("Drag", "to draw"), ("Hold ⌥", "to click for real"), ("Esc", "to exit")])
+        bar.showHint([("Pointer", "to click"), ("Draw", "to sketch"), ("Screenshot", "to select"), ("Esc", "to exit")])
         if let data = bar.snapshotHint()?.representation(using: .png, properties: [:]) {
             let hintOut = out.replacingOccurrences(of: ".png", with: "-hint.png")
             try? data.write(to: URL(fileURLWithPath: hintOut))
@@ -86,8 +86,7 @@ if let idx = CommandLine.arguments.firstIndex(of: "--make-hand"), CommandLine.ar
 }
 
 if CommandLine.arguments.contains("--e2e-test") {
-    E2ETest.run()
-    exit(0)
+    exit(E2ETest.run())
 }
 
 if CommandLine.arguments.contains("--click-test") {

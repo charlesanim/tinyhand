@@ -1,6 +1,14 @@
 import AppKit
 
 final class Ink {
+    struct Stroke {
+        let path: CGPath
+        let color: CGColor
+        let width: CGFloat
+    }
+
+    private(set) var savedStrokes: [Stroke] = []
+    var origin = CGPoint.zero
     let layer = CALayer()
     var keep: Bool { Preferences.fadeSeconds <= 0 }
 
@@ -57,6 +65,11 @@ final class Ink {
         guard let s = stroke else {
             return
         }
+        if let path = s.path, let color = s.strokeColor {
+            let globalPath = CGMutablePath()
+            globalPath.addPath(path, transform: CGAffineTransform(translationX: origin.x, y: origin.y))
+            savedStrokes.append(Stroke(path: globalPath, color: color, width: s.lineWidth))
+        }
         stroke = nil
         points = []
         freeze(s)
@@ -67,6 +80,11 @@ final class Ink {
     }
 
     func clear() {
+        savedStrokes.removeAll()
+        clearVisible()
+    }
+
+    func clearVisible() {
         stroke = nil
         points = []
         layer.sublayers?.forEach { $0.removeFromSuperlayer() }
